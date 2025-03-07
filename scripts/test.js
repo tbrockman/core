@@ -180,6 +180,8 @@ if (options.common) {
 
 const testsGlob = join(import.meta.dirname, `../tests/fs/${options.test || '*'}.test.ts`);
 
+console.log({ testsGlob });
+
 for (const setupFile of positionals) {
 	if (!existsSync(setupFile)) {
 		!options.quiet && console.warn('Skipping tests for non-existent setup file:', setupFile);

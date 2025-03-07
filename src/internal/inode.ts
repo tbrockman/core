@@ -75,7 +75,8 @@ export class Inode implements InodeLike {
 
 		deserialize(this, data);
 		const rawAttr = data.subarray(sizeof(Inode));
-		if (rawAttr.length != this.attributes_size) err(new ErrnoError(Errno.EIO, 'Attributes size mismatch with actual size'));
+		if (rawAttr.length != this.attributes_size)
+			err(new ErrnoError(Errno.EIO, `Attributes size mismatch with actual size: ${rawAttr.length} != ${this.attributes_size}`));
 		else if (rawAttr.length < 2) warn('Attributes is empty');
 		else this.attributes = JSON.parse(decodeUTF8(rawAttr));
 	}
@@ -150,6 +151,8 @@ export class Inode implements InodeLike {
 		}
 
 		if (data.attributes && JSON.stringify(this.attributes) !== JSON.stringify(data.attributes)) {
+			// @ts-expect-error
+			debug('filechanged: ', data.attributes, this.attributes);
 			this.attributes = data.attributes;
 			this.attributes_size = encodeUTF8(JSON.stringify(this.attributes)).byteLength;
 			hasChanged = true;

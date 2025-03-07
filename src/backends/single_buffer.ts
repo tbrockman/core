@@ -8,6 +8,7 @@ import type { Backend } from './backend.js';
 import { StoreFS } from './store/fs.js';
 import { SyncMapTransaction, type SyncMapStore } from './store/map.js';
 import type { Store } from './store/store.js';
+import { debug } from 'node:console';
 
 @struct()
 class MetadataEntry {
@@ -40,7 +41,7 @@ class MetadataBlock {
 		protected readonly superblock: SuperBlock,
 		public offset: number = 0
 	) {
-		if (!offset) return; // fresh block
+		if (!offset && superblock.used_bytes === BigInt(0)) return; // fresh block
 
 		deserialize(this, superblock.store._buffer.subarray(offset, offset + sizeof(MetadataBlock)));
 
@@ -85,6 +86,8 @@ class SuperBlock {
 		if (store._view.getUint32(offsetof(SuperBlock, 'magic'), true) != sb_magic) {
 			warn('SingleBuffer: Invalid magic value, assuming this is a fresh super block');
 			this.metadata = new MetadataBlock(this);
+			this.metadata.offset = sizeof(SuperBlock);
+			this.metadata_offset = this.metadata.offset;
 			this.used_bytes = BigInt(sizeof(SuperBlock) + sizeof(MetadataBlock));
 			this.total_bytes = BigInt(store._buffer.byteLength);
 			store._write(this);
@@ -96,7 +99,7 @@ class SuperBlock {
 
 		if (!checksumMatches(this)) throw crit(new ErrnoError(Errno.EIO, 'SingleBuffer: Checksum mismatch for super block!'));
 
-		this.metadata = new MetadataBlock(this, this.metadata_offset);
+		this.metadata = new MetadataBlock(this, sizeof(SuperBlock));
 	}
 
 	/**
@@ -251,8 +254,11 @@ export class SingleBufferStore implements SyncMapStore {
 	}
 
 	public get(id: number): Uint8Array | undefined {
+		debug('getting id: ', id);
 		for (let block: MetadataBlock | undefined = this.superblock.metadata; block; block = block.previous) {
+			debug('\tmetadatablock offset: ', block.offset);
 			for (const entry of block.entries) {
+				if (entry.size) debug('\t\tblock entry: ', entry.id, entry.offset, entry.size);
 				if (entry.offset && entry.id == id) {
 					return this._buffer.subarray(entry.offset, entry.offset + entry.size);
 				}
@@ -261,9 +267,12 @@ export class SingleBufferStore implements SyncMapStore {
 	}
 
 	public set(id: number, data: Uint8Array): void {
+		debug('setting id: ', id);
 		for (let block: MetadataBlock | undefined = this.superblock.metadata; block; block = block.previous) {
+			debug('\tmetadatablock offset: ', block.offset);
 			for (const entry of block.entries) {
 				if (!entry.offset || entry.id != id) continue;
+				if (entry.size) debug('\t\tblock entry: ', entry.id, entry.offset, entry.size);
 
 				if (data.length <= entry.size) {
 					this._buffer.set(data, entry.offset);

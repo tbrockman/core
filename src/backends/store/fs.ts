@@ -548,7 +548,10 @@ export class StoreFS<T extends Store = Store> extends FileSystem {
 	 */
 	public async checkRoot(): Promise<void> {
 		await using tx = this.transaction();
-		if (await tx.get(rootIno)) return;
+		if (await tx.get(rootIno)) {
+			debug('checkRoot: Root inode already exists, exiting');
+			return;
+		}
 
 		const inode = new Inode({ ino: rootIno, data: 1, mode: 0o777 | S_IFDIR });
 		await tx.set(inode.data, encodeUTF8('{}'));
@@ -563,7 +566,10 @@ export class StoreFS<T extends Store = Store> extends FileSystem {
 	 */
 	public checkRootSync(): void {
 		using tx = this.transaction();
-		if (tx.getSync(rootIno)) return;
+		if (tx.getSync(rootIno)) {
+			debug('checkRootSync: Root inode already exists, exiting');
+			return;
+		}
 
 		const inode = new Inode({ ino: rootIno, data: 1, mode: 0o777 | S_IFDIR });
 		tx.setSync(inode.data, encodeUTF8('{}'));
@@ -597,7 +603,7 @@ export class StoreFS<T extends Store = Store> extends FileSystem {
 
 		if (rootData.length != sizeof(Inode)) {
 			crit('Store contains an invalid root inode. Refusing to populate tables');
-			return;
+			// return;
 		}
 
 		// Keep track of directories we have already traversed to avoid loops
@@ -614,20 +620,21 @@ export class StoreFS<T extends Store = Store> extends FileSystem {
 
 			this._add(ino, path);
 
-			debug(`Looking at inode: ${ino} for path: ${path}`,)
+			debug(`Looking at inode: ${ino} for path: ${path}`);
 
 			// Get the inode data from the store
 			const inodeData = await tx.get(ino);
 
-			debug(inodeData)
+			// @ts-expect-error
+			debug(inodeData);
 			if (!inodeData) {
 				warn('Store is missing data for inode: ' + ino);
 				continue;
 			}
 
 			if (inodeData.length != sizeof(Inode)) {
-				warn(`Invalid inode size for ino ${ino}: ${inodeData.length}`);
-				continue;
+				warn(`Invalid inode size for ino ${ino}: ${inodeData.length}, expected ${sizeof(Inode)}`);
+				// continue;
 			}
 
 			// Parse the raw data into our Inode object
