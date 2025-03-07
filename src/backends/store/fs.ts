@@ -601,7 +601,7 @@ export class StoreFS<T extends Store = Store> extends FileSystem {
 			return;
 		}
 
-		if (rootData.length != sizeof(Inode)) {
+		if (rootData.length < sizeof(Inode)) {
 			crit('Store contains an invalid root inode. Refusing to populate tables');
 			// return;
 		}
@@ -632,9 +632,9 @@ export class StoreFS<T extends Store = Store> extends FileSystem {
 				continue;
 			}
 
-			if (inodeData.length != sizeof(Inode)) {
-				warn(`Invalid inode size for ino ${ino}: ${inodeData.length}, expected ${sizeof(Inode)}`);
-				// continue;
+			if (inodeData.length < sizeof(Inode)) {
+				warn(`Invalid inode size for ino ${ino}: ${inodeData.length}`);
+				continue;
 			}
 
 			// Parse the raw data into our Inode object
