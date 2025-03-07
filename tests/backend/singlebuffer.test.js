@@ -1,20 +1,24 @@
 import test, { suite } from 'node:test';
-import { fs as _fs, configure, mount, resolveMountConfig, SingleBuffer, umount } from '../../src/index.js';
+import { fs as _fs, mount, resolveMountConfig, SingleBuffer, umount } from '../../src/index.js';
+import assert from 'node:assert';
 
 await suite('SingleBuffer`', () => {
-	test('should be able to restore filesystem from original buffer', async () => {
-		configure({ log: { level: 'debug' } });
-		umount('/');
-
+	test('should be able to restore filesystem (with same metadata) from original buffer', async () => {
 		const buffer = new ArrayBuffer(0x100000);
+
+		umount('/');
 		const writable = await resolveMountConfig({ backend: SingleBuffer, buffer });
 		mount('/', writable);
+
 		_fs.writeFileSync('/example.ts', 'hello', 'utf-8');
-		_fs.statSync('/example.ts'); // <-- file exists
+		const stats = _fs.statSync('/example.ts');
 
 		umount('/');
 		const snapshot = await resolveMountConfig({ backend: SingleBuffer, buffer });
 		mount('/', snapshot);
-		_fs.statSync('/example.ts'); // <-- exception thrown here
+
+		const snapshotStats = _fs.statSync('/example.ts');
+
+		assert.deepEqual(snapshotStats, stats);
 	});
 });

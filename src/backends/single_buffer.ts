@@ -99,7 +99,7 @@ class SuperBlock {
 
 		if (!checksumMatches(this)) throw crit(new ErrnoError(Errno.EIO, 'SingleBuffer: Checksum mismatch for super block!'));
 
-		this.metadata = new MetadataBlock(this, sizeof(SuperBlock));
+		this.metadata = new MetadataBlock(this, this.metadata_offset);
 	}
 
 	/**
