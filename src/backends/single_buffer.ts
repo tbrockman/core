@@ -8,7 +8,6 @@ import type { Backend } from './backend.js';
 import { StoreFS } from './store/fs.js';
 import { SyncMapTransaction, type SyncMapStore } from './store/map.js';
 import type { Store } from './store/store.js';
-import { debug } from 'node:console';
 
 @struct()
 class MetadataEntry {
@@ -254,11 +253,8 @@ export class SingleBufferStore implements SyncMapStore {
 	}
 
 	public get(id: number): Uint8Array | undefined {
-		debug('getting id: ', id);
 		for (let block: MetadataBlock | undefined = this.superblock.metadata; block; block = block.previous) {
-			debug('\tmetadatablock offset: ', block.offset);
 			for (const entry of block.entries) {
-				if (entry.size) debug('\t\tblock entry: ', entry.id, entry.offset, entry.size);
 				if (entry.offset && entry.id == id) {
 					return this._buffer.subarray(entry.offset, entry.offset + entry.size);
 				}
@@ -267,12 +263,9 @@ export class SingleBufferStore implements SyncMapStore {
 	}
 
 	public set(id: number, data: Uint8Array): void {
-		debug('setting id: ', id);
 		for (let block: MetadataBlock | undefined = this.superblock.metadata; block; block = block.previous) {
-			debug('\tmetadatablock offset: ', block.offset);
 			for (const entry of block.entries) {
 				if (!entry.offset || entry.id != id) continue;
-				if (entry.size) debug('\t\tblock entry: ', entry.id, entry.offset, entry.size);
 
 				if (data.length <= entry.size) {
 					this._buffer.set(data, entry.offset);

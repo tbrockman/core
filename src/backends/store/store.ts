@@ -4,7 +4,6 @@ import { err, warn } from '../../internal/log.js';
 import '../../polyfills.js';
 import type { StoreFS } from './fs.js';
 import type { UsageInfo } from '../../internal/filesystem.js';
-import { debug } from 'node:console';
 
 /**
  * @category Stores and Transactions
@@ -304,7 +303,6 @@ export class WrappedTransaction<T extends Store = Store> {
 	}
 
 	public abortSync(): void {
-		debug('in abort sync, done: ', this.done);
 		if (this.done) return;
 		// Rollback old values.
 		for (const [id, entries] of this.originalData) {

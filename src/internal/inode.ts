@@ -138,8 +138,6 @@ export class Inode implements InodeLike {
 		}
 
 		if (data.attributes && JSON.stringify(this.attributes) !== JSON.stringify(data.attributes)) {
-			// @ts-expect-error
-			debug('filechanged: ', data.attributes, this.attributes);
 			this.attributes = data.attributes;
 			this.attributes_size = encodeUTF8(JSON.stringify(this.attributes)).byteLength;
 			hasChanged = true;
