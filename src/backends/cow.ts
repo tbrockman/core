@@ -214,7 +214,8 @@ export class CopyOnWriteFS extends FileSystem {
 
 	public async stat(path: string): Promise<InodeLike> {
 		try {
-			return await this.writable.stat(path);
+			const stat = await this.writable.stat(path);
+			return stat;
 		} catch {
 			if (this.isDeleted(path)) throw ErrnoError.With('ENOENT', path, 'stat');
 
