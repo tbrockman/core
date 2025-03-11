@@ -609,8 +609,12 @@ export class StoreFS<T extends Store = Store> extends FileSystem {
 
 			this._add(ino, path);
 
+			debug(`Looking at inode: ${ino} for path: ${path}`,)
+
 			// Get the inode data from the store
 			const inodeData = await tx.get(ino);
+
+			debug(inodeData)
 			if (!inodeData) {
 				warn('Store is missing data for inode: ' + ino);
 				continue;
