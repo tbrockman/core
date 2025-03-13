@@ -101,7 +101,7 @@ export type FilesystemOf<T extends Backend> = T extends Backend<infer FS> ? FS :
  * @internal
  */
 export function isBackend(arg: unknown): arg is Backend {
-	return arg != null && typeof arg == 'object' && 'create' in arg && 'name' in arg && typeof arg.create == 'function';
+	return arg != null && typeof arg == 'object' && 'create' in arg && typeof arg.create == 'function';
 }
 
 /**
