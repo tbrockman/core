@@ -1,139 +1,11 @@
 import type { V_Context } from '../context.js';
+import { defaultContext } from '../internal/contexts.js';
 import { Errno, ErrnoError } from '../internal/error.js';
 import type { FileSystem, StreamOptions } from '../internal/filesystem.js';
 import { InodeFlags, isBlockDevice, isCharacterDevice, type InodeLike } from '../internal/inode.js';
 import '../polyfills.js';
-import { config } from './config.js';
 import * as c from './constants.js';
 import { _chown } from './stats.js';
-
-const validFlags = ['r', 'r+', 'rs', 'rs+', 'w', 'wx', 'w+', 'wx+', 'a', 'ax', 'a+', 'ax+'];
-
-/**
- * @internal @hidden
- */
-export function parseFlag(flag: string | number): string {
-	if (typeof flag === 'number') {
-		return flagToString(flag);
-	}
-	if (!validFlags.includes(flag)) {
-		throw new Error('Invalid flag string: ' + flag);
-	}
-	return flag;
-}
-
-/**
- * @internal @hidden
- */
-export function flagToString(flag: number): string {
-	switch (flag) {
-		case c.O_RDONLY:
-			return 'r';
-		case c.O_RDONLY | c.O_SYNC:
-			return 'rs';
-		case c.O_RDWR:
-			return 'r+';
-		case c.O_RDWR | c.O_SYNC:
-			return 'rs+';
-		case c.O_TRUNC | c.O_CREAT | c.O_WRONLY:
-			return 'w';
-		case c.O_TRUNC | c.O_CREAT | c.O_WRONLY | c.O_EXCL:
-			return 'wx';
-		case c.O_TRUNC | c.O_CREAT | c.O_RDWR:
-			return 'w+';
-		case c.O_TRUNC | c.O_CREAT | c.O_RDWR | c.O_EXCL:
-			return 'wx+';
-		case c.O_APPEND | c.O_CREAT | c.O_WRONLY:
-			return 'a';
-		case c.O_APPEND | c.O_CREAT | c.O_WRONLY | c.O_EXCL:
-			return 'ax';
-		case c.O_APPEND | c.O_CREAT | c.O_RDWR:
-			return 'a+';
-		case c.O_APPEND | c.O_CREAT | c.O_RDWR | c.O_EXCL:
-			return 'ax+';
-		default:
-			throw new Error('Invalid flag number: ' + flag);
-	}
-}
-
-/**
- * @internal @hidden
- */
-export function flagToNumber(flag: string): number {
-	switch (flag) {
-		case 'r':
-			return c.O_RDONLY;
-		case 'rs':
-			return c.O_RDONLY | c.O_SYNC;
-		case 'r+':
-			return c.O_RDWR;
-		case 'rs+':
-			return c.O_RDWR | c.O_SYNC;
-		case 'w':
-			return c.O_TRUNC | c.O_CREAT | c.O_WRONLY;
-		case 'wx':
-			return c.O_TRUNC | c.O_CREAT | c.O_WRONLY | c.O_EXCL;
-		case 'w+':
-			return c.O_TRUNC | c.O_CREAT | c.O_RDWR;
-		case 'wx+':
-			return c.O_TRUNC | c.O_CREAT | c.O_RDWR | c.O_EXCL;
-		case 'a':
-			return c.O_APPEND | c.O_CREAT | c.O_WRONLY;
-		case 'ax':
-			return c.O_APPEND | c.O_CREAT | c.O_WRONLY | c.O_EXCL;
-		case 'a+':
-			return c.O_APPEND | c.O_CREAT | c.O_RDWR;
-		case 'ax+':
-			return c.O_APPEND | c.O_CREAT | c.O_RDWR | c.O_EXCL;
-		default:
-			throw new Error('Invalid flag string: ' + flag);
-	}
-}
-
-/**
- * Parses a flag as a mode (W_OK, R_OK, and/or X_OK)
- * @param flag the flag to parse
- * @internal @hidden
- */
-export function flagToMode(flag: string): number {
-	let mode = 0;
-	mode <<= 1;
-	mode += +isReadable(flag);
-	mode <<= 1;
-	mode += +isWriteable(flag);
-	mode <<= 1;
-	return mode;
-}
-
-/** @hidden */
-export function isReadable(flag: string): boolean {
-	return flag.indexOf('r') !== -1 || flag.indexOf('+') !== -1;
-}
-
-/** @hidden */
-export function isWriteable(flag: string): boolean {
-	return flag.indexOf('w') !== -1 || flag.indexOf('a') !== -1 || flag.indexOf('+') !== -1;
-}
-
-/** @hidden */
-export function isTruncating(flag: string): boolean {
-	return flag.indexOf('w') !== -1;
-}
-
-/** @hidden */
-export function isAppendable(flag: string): boolean {
-	return flag.indexOf('a') !== -1;
-}
-
-/** @hidden */
-export function isSynchronous(flag: string): boolean {
-	return flag.indexOf('s') !== -1;
-}
-
-/** @hidden */
-export function isExclusive(flag: string): boolean {
-	return flag.indexOf('x') !== -1;
-}
 
 /** @hidden */
 export interface FileReadResult<T extends ArrayBufferView> {
@@ -162,7 +34,7 @@ export class SyncHandle {
 	 * @returns The current file position.
 	 */
 	public get position(): number {
-		return isAppendable(this.flag) ? this.stats.size : this._position;
+		return this.flag & c.O_APPEND ? this.inode.size : this._position;
 	}
 
 	public set position(value: number) {
@@ -188,12 +60,16 @@ export class SyncHandle {
 		public readonly path: string,
 		public readonly fs: FileSystem,
 		public readonly internalPath: string,
-		public readonly flag: string,
-		public readonly stats: InodeLike
+		public readonly flag: number,
+		public readonly inode: InodeLike
 	) {}
 
 	public [Symbol.dispose](): void {
 		this.close();
+	}
+
+	private get _isSync(): boolean {
+		return !!(this.flag & c.O_SYNC || this.inode.flags! & InodeFlags.Sync);
 	}
 
 	public sync(): void {
@@ -201,7 +77,7 @@ export class SyncHandle {
 
 		if (!this.dirty) return;
 
-		if (!this.fs.attributes.has('no_write')) this.fs.touchSync(this.internalPath, this.stats);
+		if (!this.fs.attributes.has('no_write')) this.fs.touchSync(this.internalPath, this.inode);
 
 		this.dirty = false;
 	}
@@ -233,20 +109,21 @@ export class SyncHandle {
 	public stat(): InodeLike {
 		if (this.closed) throw ErrnoError.With('EBADF', this.path, 'stat');
 
-		return this.stats;
+		return this.inode;
 	}
 
 	public truncate(length: number): void {
 		if (this.closed) throw ErrnoError.With('EBADF', this.path, 'truncate');
 
 		this.dirty = true;
-		if (!isWriteable(this.flag)) {
-			throw new ErrnoError(Errno.EPERM, 'File not opened with a writeable mode');
+		if (!(this.flag & c.O_WRONLY || this.flag & c.O_RDWR)) {
+			throw new ErrnoError(Errno.EPERM, 'File not opened with a writeable mode', this.path, 'truncate');
 		}
-		this.stats.mtimeMs = Date.now();
-		this.stats.size = length;
-		this.stats.ctimeMs = Date.now();
-		if (config.syncImmediately) this.sync();
+		this.inode.mtimeMs = Date.now();
+		this.inode.size = length;
+		this.inode.ctimeMs = Date.now();
+
+		if (this._isSync) this.sync();
 	}
 
 	/**
@@ -261,24 +138,24 @@ export class SyncHandle {
 	public write(buffer: Uint8Array, offset: number = 0, length: number = buffer.byteLength - offset, position: number = this.position): number {
 		if (this.closed) throw ErrnoError.With('EBADF', this.path, 'write');
 
-		if (!isWriteable(this.flag)) throw new ErrnoError(Errno.EPERM, 'File not opened with a writeable mode');
+		if (!(this.flag & c.O_WRONLY || this.flag & c.O_RDWR)) throw new ErrnoError(Errno.EPERM, 'File not opened with a writeable mode');
 
-		if (this.stats.flags! & InodeFlags.Immutable) throw new ErrnoError(Errno.EPERM, 'File is immutable', this.path, 'write');
+		if (this.inode.flags! & InodeFlags.Immutable) throw new ErrnoError(Errno.EPERM, 'File is immutable', this.path, 'write');
 
 		this.dirty = true;
 		const end = position + length;
 		const slice = buffer.subarray(offset, offset + length);
 
-		if (!isCharacterDevice(this.stats) && !isBlockDevice(this.stats) && end > this.stats.size) this.stats.size = end;
+		if (!isCharacterDevice(this.inode) && !isBlockDevice(this.inode) && end > this.inode.size) this.inode.size = end;
 
-		this.stats.mtimeMs = Date.now();
-		this.stats.ctimeMs = Date.now();
+		this.inode.mtimeMs = Date.now();
+		this.inode.ctimeMs = Date.now();
 
 		this._position = position + slice.byteLength;
 
 		this.fs.writeSync(this.internalPath, slice, position);
 
-		if (config.syncImmediately) this.sync();
+		if (this._isSync) this.sync();
 		return slice.byteLength;
 	}
 
@@ -294,35 +171,36 @@ export class SyncHandle {
 	public read(buffer: ArrayBufferView, offset: number = 0, length: number = buffer.byteLength - offset, position: number = this.position): number {
 		if (this.closed) throw ErrnoError.With('EBADF', this.path, 'read');
 
-		if (!isReadable(this.flag)) throw new ErrnoError(Errno.EPERM, 'File not opened with a readable mode');
+		if (this.flag & c.O_WRONLY) throw new ErrnoError(Errno.EPERM, 'File not opened with a readable mode');
 
-		if (config.updateOnRead) this.dirty = true;
-
-		this.stats.atimeMs = Date.now();
+		if (!(this.inode.flags! & InodeFlags.NoAtime)) {
+			this.dirty = true;
+			this.inode.atimeMs = Date.now();
+		}
 
 		let end = position + length;
-		if (!isCharacterDevice(this.stats) && !isBlockDevice(this.stats) && end > this.stats.size) {
-			end = position + Math.max(this.stats.size - position, 0);
+		if (!isCharacterDevice(this.inode) && !isBlockDevice(this.inode) && end > this.inode.size) {
+			end = position + Math.max(this.inode.size - position, 0);
 		}
 		this._position = end;
 		const uint8 = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
 		this.fs.readSync(this.internalPath, uint8.subarray(offset, offset + length), position, end);
-		if (config.syncImmediately) this.sync();
+		if (this._isSync) this.sync();
 		return end - position;
 	}
 
 	public chmod(mode: number): void {
 		if (this.closed) throw ErrnoError.With('EBADF', this.path, 'chmod');
 		this.dirty = true;
-		this.stats.mode = (this.stats.mode & (mode > c.S_IFMT ? ~c.S_IFMT : c.S_IFMT)) | mode;
-		if (config.syncImmediately || mode > c.S_IFMT) this.sync();
+		this.inode.mode = (this.inode.mode & (mode > c.S_IFMT ? ~c.S_IFMT : c.S_IFMT)) | mode;
+		if (this._isSync || mode > c.S_IFMT) this.sync();
 	}
 
 	public chown(uid: number, gid: number): void {
 		if (this.closed) throw ErrnoError.With('EBADF', this.path, 'chown');
 		this.dirty = true;
-		_chown(this.stats, uid, gid);
-		if (config.syncImmediately) this.sync();
+		_chown(this.inode, uid, gid);
+		if (this._isSync) this.sync();
 	}
 
 	/**
@@ -332,9 +210,9 @@ export class SyncHandle {
 		if (this.closed) throw ErrnoError.With('EBADF', this.path, 'utimes');
 
 		this.dirty = true;
-		this.stats.atimeMs = atime;
-		this.stats.mtimeMs = mtime;
-		if (config.syncImmediately) this.sync();
+		this.inode.atimeMs = atime;
+		this.inode.mtimeMs = mtime;
+		if (this._isSync) this.sync();
 	}
 
 	/**
@@ -351,7 +229,7 @@ export class SyncHandle {
 	 */
 	public streamWrite(options: StreamOptions): WritableStream {
 		if (this.closed) throw ErrnoError.With('EBADF', this.path, 'streamWrite');
-		if (this.stats.flags! & InodeFlags.Immutable) throw new ErrnoError(Errno.EPERM, 'File is immutable', this.path, 'streamWrite');
+		if (this.inode.flags! & InodeFlags.Immutable) throw new ErrnoError(Errno.EPERM, 'File is immutable', this.path, 'streamWrite');
 		return this.fs.streamWrite(this.internalPath, options);
 	}
 }
@@ -359,17 +237,11 @@ export class SyncHandle {
 // descriptors
 
 /**
- * A map of FDs that are not bound to a context.
- * @internal @hidden
- */
-const fdMap = new Map<number, SyncHandle>();
-
-/**
  * @internal @hidden
  */
 export function toFD(file: SyncHandle): number {
-	const map = file.context?.descriptors ?? fdMap;
-	const fd = map.size ? Math.max(...map.keys()) + 1 : 0;
+	const map = file.context?.descriptors ?? defaultContext.descriptors;
+	const fd = Math.max(map.size ? Math.max(...map.keys()) + 1 : 0, 4);
 	map.set(fd, file);
 	return fd;
 }
@@ -378,12 +250,12 @@ export function toFD(file: SyncHandle): number {
  * @internal @hidden
  */
 export function fromFD($: V_Context, fd: number): SyncHandle {
-	const map = $?.descriptors ?? fdMap;
+	const map = $?.descriptors ?? defaultContext.descriptors;
 	const value = map.get(fd);
 	if (!value) throw new ErrnoError(Errno.EBADF);
 	return value;
 }
 
 export function deleteFD($: V_Context, fd: number): boolean {
-	return ($?.descriptors ?? fdMap).delete(fd);
+	return ($?.descriptors ?? defaultContext.descriptors).delete(fd);
 }

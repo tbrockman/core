@@ -4,25 +4,26 @@ import type * as promises from 'node:fs/promises';
 import type { Stream } from 'node:stream';
 import type { ReadableStream as NodeReadableStream } from 'node:stream/web';
 import type { V_Context } from '../context.js';
+import type { FileSystem, StreamOptions } from '../internal/filesystem.js';
 import type { InodeLike } from '../internal/inode.js';
 import type { Interface as ReadlineInterface } from '../readline.js';
 import type { ResolvedPath } from './shared.js';
 import type { FileContents, GlobOptionsU, NullEnc, OpenOptions, ReaddirOptions, ReaddirOptsI, ReaddirOptsU } from './types.js';
 
 import { Buffer } from 'buffer';
-import { _throw, pick } from 'utilium';
-import { credentials } from '../internal/credentials.js';
+import { _throw, decodeUTF8, pick } from 'utilium';
+import { defaultContext } from '../internal/contexts.js';
 import { Errno, ErrnoError } from '../internal/error.js';
-import type { FileSystem, StreamOptions } from '../internal/filesystem.js';
-import { InodeFlags, isBlockDevice, isCharacterDevice } from '../internal/inode.js';
+import { hasAccess, InodeFlags, isBlockDevice, isCharacterDevice, isDirectory, isSymbolicLink } from '../internal/inode.js';
 import { dirname, join, parse, resolve } from '../path.js';
 import '../polyfills.js';
 import { createInterface } from '../readline.js';
-import { decodeUTF8, normalizeMode, normalizeOptions, normalizePath, normalizeTime } from '../utils.js';
-import { config } from './config.js';
+import { normalizeMode, normalizeOptions, normalizePath, normalizeTime } from '../utils.js';
+import { checkAccess } from './config.js';
 import * as constants from './constants.js';
 import { Dir, Dirent } from './dir.js';
-import * as file from './file.js';
+import { deleteFD, fromFD, SyncHandle, toFD } from './file.js';
+import * as flags from './flags.js';
 import { _statfs, fixError, resolveMount } from './shared.js';
 import { _chown, BigIntStats, Stats } from './stats.js';
 import { ReadStream, WriteStream } from './streams.js';
@@ -47,7 +48,7 @@ export class FileHandle implements promises.FileHandle {
 	 * @returns The current file position.
 	 */
 	public get position(): number {
-		return file.isAppendable(this.flag) ? this.stats.size : this._position;
+		return this.flag & constants.O_APPEND ? this.inode.size : this._position;
 	}
 
 	public set position(value: number) {
@@ -74,17 +75,21 @@ export class FileHandle implements promises.FileHandle {
 	public readonly internalPath!: string;
 
 	/** The flag the handle was opened with */
-	public readonly flag!: string;
+	public readonly flag!: number;
 
 	/** Stats for the handle */
-	public readonly stats!: InodeLike;
+	public readonly inode!: InodeLike;
 
 	public constructor(
 		protected context: V_Context,
 		public readonly fd: number
 	) {
-		const sync = file.fromFD(context, fd);
-		Object.assign(this, pick(sync, 'path', 'fs', 'internalPath', 'flag', 'stats'));
+		const sync = fromFD(context, fd);
+		Object.assign(this, pick(sync, 'path', 'fs', 'internalPath', 'flag', 'inode'));
+	}
+
+	private get _isSync(): boolean {
+		return !!(this.flag & constants.O_SYNC || this.inode.flags! & InodeFlags.Sync);
 	}
 
 	private _emitChange() {
@@ -97,8 +102,8 @@ export class FileHandle implements promises.FileHandle {
 	public async chown(uid: number, gid: number): Promise<void> {
 		if (this.closed) throw ErrnoError.With('EBADF', this.path, 'chown');
 		this.dirty = true;
-		_chown(this.stats, uid, gid);
-		if (config.syncImmediately) await this.sync();
+		_chown(this.inode, uid, gid);
+		if (this._isSync) await this.sync();
 		this._emitChange();
 	}
 
@@ -111,8 +116,8 @@ export class FileHandle implements promises.FileHandle {
 		if (numMode < 0) throw new ErrnoError(Errno.EINVAL, 'Invalid mode');
 		if (this.closed) throw ErrnoError.With('EBADF', this.path, 'chmod');
 		this.dirty = true;
-		this.stats.mode = (this.stats.mode & (numMode > constants.S_IFMT ? ~constants.S_IFMT : constants.S_IFMT)) | numMode;
-		if (config.syncImmediately || numMode > constants.S_IFMT) await this.sync();
+		this.inode.mode = (this.inode.mode & (numMode > constants.S_IFMT ? ~constants.S_IFMT : constants.S_IFMT)) | numMode;
+		if (this._isSync || numMode > constants.S_IFMT) await this.sync();
 		this._emitChange();
 	}
 
@@ -131,7 +136,7 @@ export class FileHandle implements promises.FileHandle {
 
 		if (!this.dirty) return;
 
-		if (!this.fs.attributes.has('no_write')) await this.fs.touch(this.internalPath, this.stats);
+		if (!this.fs.attributes.has('no_write')) await this.fs.touch(this.internalPath, this.inode);
 		this.dirty = false;
 	}
 
@@ -145,12 +150,12 @@ export class FileHandle implements promises.FileHandle {
 		if (length < 0) throw new ErrnoError(Errno.EINVAL);
 
 		this.dirty = true;
-		if (!file.isWriteable(this.flag)) {
-			throw new ErrnoError(Errno.EPERM, 'File not opened with a writeable mode');
+		if (!(this.flag & constants.O_WRONLY || this.flag & constants.O_RDWR)) {
+			throw new ErrnoError(Errno.EPERM, 'File not opened with a writeable mode', this.path, 'truncate');
 		}
-		this.stats.mtimeMs = Date.now();
-		this.stats.size = length;
-		if (config.syncImmediately) await this.sync();
+		this.inode.mtimeMs = Date.now();
+		this.inode.size = length;
+		if (this._isSync) await this.sync();
 		this._emitChange();
 	}
 
@@ -163,9 +168,9 @@ export class FileHandle implements promises.FileHandle {
 		if (this.closed) throw ErrnoError.With('EBADF', this.path, 'utimes');
 
 		this.dirty = true;
-		this.stats.atimeMs = normalizeTime(atime);
-		this.stats.mtimeMs = normalizeTime(mtime);
-		if (config.syncImmediately) await this.sync();
+		this.inode.atimeMs = normalizeTime(atime);
+		this.inode.mtimeMs = normalizeTime(mtime);
+		if (this._isSync) await this.sync();
 
 		this._emitChange();
 	}
@@ -184,8 +189,8 @@ export class FileHandle implements promises.FileHandle {
 		_options: (fs.ObjectEncodingOptions & promises.FlagAndOpenMode) | BufferEncoding = {}
 	): Promise<void> {
 		const options = normalizeOptions(_options, 'utf8', 'a', 0o644);
-		const flag = file.parseFlag(options.flag);
-		if (!file.isAppendable(flag)) {
+		const flag = flags.parse(options.flag);
+		if (!(flag & constants.O_APPEND)) {
 			throw new ErrnoError(Errno.EINVAL, 'Flag passed to appendFile must allow for appending');
 		}
 		if (typeof data != 'string' && !options.encoding) {
@@ -212,20 +217,21 @@ export class FileHandle implements promises.FileHandle {
 	): Promise<{ bytesRead: number; buffer: TBuffer }> {
 		if (this.closed) throw ErrnoError.With('EBADF', this.path, 'read');
 
-		if (!file.isReadable(this.flag)) throw new ErrnoError(Errno.EPERM, 'File not opened with a readable mode');
+		if (this.flag & constants.O_WRONLY) throw new ErrnoError(Errno.EPERM, 'File not opened with a readable mode');
 
-		if (config.updateOnRead) this.dirty = true;
-
-		this.stats.atimeMs = Date.now();
+		if (!(this.inode.flags! & InodeFlags.NoAtime)) {
+			this.dirty = true;
+			this.inode.atimeMs = Date.now();
+		}
 
 		let end = position + length;
-		if (!isCharacterDevice(this.stats) && !isBlockDevice(this.stats) && end > this.stats.size) {
-			end = position + Math.max(this.stats.size - position, 0);
+		if (!isCharacterDevice(this.inode) && !isBlockDevice(this.inode) && end > this.inode.size) {
+			end = position + Math.max(this.inode.size - position, 0);
 		}
 		this._position = end;
 		const uint8 = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
 		await this.fs.read(this.internalPath, uint8.subarray(offset, offset + length), position, end);
-		if (config.syncImmediately) await this.sync();
+		if (this._isSync) await this.sync();
 		return { bytesRead: end - position, buffer };
 	}
 
@@ -268,7 +274,7 @@ export class FileHandle implements promises.FileHandle {
 		}
 
 		const pos = Number.isSafeInteger(position) ? position! : this.position;
-		buffer ||= new Uint8Array(this.stats.size) as T;
+		buffer ||= new Uint8Array(this.inode.size) as T;
 		offset ??= 0;
 		return this._read(buffer, offset, length ?? buffer.byteLength - offset, pos);
 	}
@@ -283,9 +289,9 @@ export class FileHandle implements promises.FileHandle {
 	public async readFile(_options: (fs.ObjectEncodingOptions & promises.FlagAndOpenMode) | BufferEncoding): Promise<string>;
 	public async readFile(_options?: (fs.ObjectEncodingOptions & promises.FlagAndOpenMode) | BufferEncoding): Promise<string | Buffer> {
 		const options = normalizeOptions(_options, null, 'r', 0o444);
-		const flag = file.parseFlag(options.flag);
-		if (!file.isReadable(flag)) {
-			throw new ErrnoError(Errno.EINVAL, 'Flag passed must allow for reading');
+		const flag = flags.parse(options.flag);
+		if (flag & constants.O_WRONLY) {
+			throw new ErrnoError(Errno.EINVAL, 'Flag passed must allow for reading', this.path, 'readFile');
 		}
 
 		const { size } = await this.stat();
@@ -312,7 +318,7 @@ export class FileHandle implements promises.FileHandle {
 	 */
 	public writableWebStream(options: promises.ReadableWebStreamOptions & StreamOptions = {}): WritableStream {
 		if (this.closed) throw ErrnoError.With('EBADF', this.path, 'writableWebStream');
-		if (this.stats.flags! & InodeFlags.Immutable) throw new ErrnoError(Errno.EPERM, 'File is immutable', this.path, 'writableWebStream');
+		if (this.inode.flags! & InodeFlags.Immutable) throw new ErrnoError(Errno.EPERM, 'File is immutable', this.path, 'writableWebStream');
 		return this.fs.streamWrite(this.internalPath, options);
 	}
 
@@ -322,11 +328,7 @@ export class FileHandle implements promises.FileHandle {
 	 * @returns A readline interface for reading the file line by line
 	 */
 	public readLines(options?: promises.CreateReadStreamOptions): ReadlineInterface {
-		if (this.closed) throw ErrnoError.With('EBADF', this.path, 'readLines');
-
-		if (!file.isReadable(this.flag)) {
-			throw ErrnoError.With('EBADF', this.path, 'readLines');
-		}
+		if (this.closed || this.flag & constants.O_WRONLY) throw ErrnoError.With('EBADF', this.path, 'readLines');
 
 		return createInterface({ input: this.createReadStream(options), crlfDelay: Infinity });
 	}
@@ -343,11 +345,11 @@ export class FileHandle implements promises.FileHandle {
 	public async stat(opts?: fs.StatOptions): Promise<Stats | BigIntStats> {
 		if (this.closed) throw ErrnoError.With('EBADF', this.path, 'stat');
 
-		const stats = new Stats(this.stats);
-		if (config.checkAccess && !stats.hasAccess(constants.R_OK, this.context)) {
+		if (checkAccess && !hasAccess(this.context, this.inode, constants.R_OK)) {
 			throw ErrnoError.With('EACCES', this.path, 'stat');
 		}
-		return opts?.bigint ? new BigIntStats(stats) : stats;
+
+		return opts?.bigint ? new BigIntStats(this.inode) : new Stats(this.inode);
 	}
 
 	/**
@@ -366,22 +368,23 @@ export class FileHandle implements promises.FileHandle {
 	): Promise<number> {
 		if (this.closed) throw ErrnoError.With('EBADF', this.path, 'write');
 
-		if (this.stats.flags! & InodeFlags.Immutable) throw new ErrnoError(Errno.EPERM, 'File is immutable', this.path, 'write');
+		if (this.inode.flags! & InodeFlags.Immutable) throw new ErrnoError(Errno.EPERM, 'File is immutable', this.path, 'write');
 
-		if (!file.isWriteable(this.flag)) throw new ErrnoError(Errno.EPERM, 'File not opened with a writeable mode');
+		if (!(this.flag & constants.O_WRONLY || this.flag & constants.O_RDWR))
+			throw new ErrnoError(Errno.EPERM, 'File not opened with a writeable mode', this.path, 'write');
 
 		this.dirty = true;
 		const end = position + length;
 		const slice = buffer.subarray(offset, offset + length);
 
-		if (!isCharacterDevice(this.stats) && !isBlockDevice(this.stats) && end > this.stats.size) this.stats.size = end;
+		if (!isCharacterDevice(this.inode) && !isBlockDevice(this.inode) && end > this.inode.size) this.inode.size = end;
 
-		this.stats.mtimeMs = Date.now();
-		this.stats.ctimeMs = Date.now();
+		this.inode.mtimeMs = Date.now();
+		this.inode.ctimeMs = Date.now();
 
 		this._position = position + slice.byteLength;
 		await this.fs.write(this.internalPath, slice, position);
-		if (config.syncImmediately) await this.sync();
+		if (this._isSync) await this.sync();
 		return slice.byteLength;
 	}
 
@@ -432,9 +435,9 @@ export class FileHandle implements promises.FileHandle {
 	 */
 	public async writeFile(data: string | Uint8Array, _options: fs.WriteFileOptions = {}): Promise<void> {
 		const options = normalizeOptions(_options, 'utf8', 'w', 0o644);
-		const flag = file.parseFlag(options.flag);
-		if (!file.isWriteable(flag)) {
-			throw new ErrnoError(Errno.EINVAL, 'Flag passed must allow for writing');
+		const flag = flags.parse(options.flag);
+		if (!(flag & constants.O_WRONLY || flag & constants.O_RDWR)) {
+			throw new ErrnoError(Errno.EINVAL, 'Flag passed must allow for writing', this.path, 'writeFile');
 		}
 		if (typeof data != 'string' && !options.encoding) {
 			throw new ErrnoError(Errno.EINVAL, 'Encoding not specified');
@@ -451,7 +454,7 @@ export class FileHandle implements promises.FileHandle {
 		if (this.closed) throw ErrnoError.With('EBADF', this.path, 'close');
 		await this.sync();
 		this.dispose();
-		file.deleteFD(this.context, this.fd);
+		deleteFD(this.context, this.fd);
 	}
 
 	/**
@@ -506,7 +509,7 @@ export class FileHandle implements promises.FileHandle {
 	 * @param options Options for the readable stream
 	 */
 	public createReadStream(options: promises.CreateReadStreamOptions = {}): ReadStream {
-		if (this.closed) throw ErrnoError.With('EBADF', this.path, 'createReadStream');
+		if (this.closed || this.flag & constants.O_WRONLY) throw ErrnoError.With('EBADF', this.path, 'createReadStream');
 		return new ReadStream(options, this);
 	}
 
@@ -516,7 +519,7 @@ export class FileHandle implements promises.FileHandle {
 	 */
 	public createWriteStream(options: promises.CreateWriteStreamOptions = {}): WriteStream {
 		if (this.closed) throw ErrnoError.With('EBADF', this.path, 'createWriteStream');
-		if (this.stats.flags! & InodeFlags.Immutable) throw new ErrnoError(Errno.EPERM, 'File is immutable', this.path, 'createWriteStream');
+		if (this.inode.flags! & InodeFlags.Immutable) throw new ErrnoError(Errno.EPERM, 'File is immutable', this.path, 'createWriteStream');
 		return new WriteStream(options, this);
 	}
 }
@@ -526,7 +529,7 @@ export async function rename(this: V_Context, oldPath: fs.PathLike, newPath: fs.
 	newPath = normalizePath(newPath);
 	const src = resolveMount(oldPath, this);
 	const dst = resolveMount(newPath, this);
-	if (config.checkAccess && !(await stat.call(this, dirname(oldPath))).hasAccess(constants.W_OK, this)) {
+	if (checkAccess && !(await stat.call(this, dirname(oldPath))).hasAccess(constants.W_OK, this)) {
 		throw ErrnoError.With('EACCES', oldPath, 'rename');
 	}
 	try {
@@ -568,11 +571,11 @@ export async function stat(this: V_Context, path: fs.PathLike, options?: fs.Stat
 	path = normalizePath(path);
 	const { fs, path: resolved } = resolveMount(await realpath.call(this, path), this);
 	try {
-		const stats = new Stats(await fs.stat(resolved));
-		if (config.checkAccess && !stats.hasAccess(constants.R_OK, this)) {
+		const stats = await fs.stat(resolved);
+		if (checkAccess && !hasAccess(this, stats, constants.R_OK)) {
 			throw ErrnoError.With('EACCES', resolved, 'stat');
 		}
-		return options?.bigint ? new BigIntStats(stats) : stats;
+		return options?.bigint ? new BigIntStats(stats) : new Stats(stats);
 	} catch (e) {
 		throw fixError(e as ErrnoError, { [resolved]: path });
 	}
@@ -590,8 +593,11 @@ export async function lstat(this: V_Context, path: fs.PathLike, options?: fs.Sta
 	path = normalizePath(path);
 	const { fs, path: resolved } = resolveMount(path, this);
 	try {
-		const stats = new Stats(await fs.stat(resolved));
-		return options?.bigint ? new BigIntStats(stats) : stats;
+		const stats = await fs.stat(resolved);
+		if (checkAccess && !hasAccess(this, stats, constants.R_OK)) {
+			throw ErrnoError.With('EACCES', resolved, 'lstat');
+		}
+		return options?.bigint ? new BigIntStats(stats) : new Stats(stats);
 	} catch (e) {
 		throw fixError(e as ErrnoError, { [resolved]: path });
 	}
@@ -610,7 +616,7 @@ export async function unlink(this: V_Context, path: fs.PathLike): Promise<void> 
 	path = normalizePath(path);
 	const { fs, path: resolved } = resolveMount(path, this);
 	try {
-		if (config.checkAccess && !new Stats(await fs.stat(resolved)).hasAccess(constants.W_OK, this)) {
+		if (checkAccess && !hasAccess(this, await fs.stat(resolved), constants.W_OK)) {
 			throw ErrnoError.With('EACCES', resolved, 'unlink');
 		}
 		await fs.unlink(resolved);
@@ -628,23 +634,25 @@ unlink satisfies typeof promises.unlink;
 async function _open($: V_Context, path: fs.PathLike, opt: OpenOptions): Promise<FileHandle> {
 	path = normalizePath(path);
 	const mode = normalizeMode(opt.mode, 0o644),
-		flag = file.parseFlag(opt.flag);
+		flag = flags.parse(opt.flag);
 
 	const { fullPath, fs, path: resolved, stats } = await _resolve($, path.toString(), opt.preserveSymlinks);
 
 	if (!stats) {
-		if ((!file.isWriteable(flag) && !file.isAppendable(flag)) || flag == 'r+') {
+		if (!(flag & constants.O_CREAT)) {
 			throw ErrnoError.With('ENOENT', fullPath, '_open');
 		}
+
 		// Create the file
-		const parentStats: Stats = new Stats(await fs.stat(dirname(resolved)));
-		if (config.checkAccess && !parentStats.hasAccess(constants.W_OK, $)) {
+		const parentStats = await fs.stat(dirname(resolved));
+		if (checkAccess && !hasAccess($, parentStats, constants.W_OK)) {
 			throw ErrnoError.With('EACCES', dirname(fullPath), '_open');
 		}
-		if (!parentStats.isDirectory()) {
+
+		if (!isDirectory(parentStats)) {
 			throw ErrnoError.With('ENOTDIR', dirname(fullPath), '_open');
 		}
-		const { euid: uid, egid: gid } = $?.credentials ?? credentials;
+		const { euid: uid, egid: gid } = $?.credentials ?? defaultContext.credentials;
 
 		const inode = await fs.createFile(resolved, {
 			mode,
@@ -652,18 +660,16 @@ async function _open($: V_Context, path: fs.PathLike, opt: OpenOptions): Promise
 			gid: parentStats.mode & constants.S_ISGID ? parentStats.gid : gid,
 		});
 
-		return new FileHandle($, file.toFD(new file.SyncHandle($, path, fs, resolved, flag, inode)));
+		return new FileHandle($, toFD(new SyncHandle($, path, fs, resolved, flag, inode)));
 	}
 
-	if (config.checkAccess && !stats.hasAccess(file.flagToMode(flag), $)) {
+	if (checkAccess && !hasAccess($, stats, flags.toMode(flag))) {
 		throw ErrnoError.With('EACCES', fullPath, '_open');
 	}
 
-	if (file.isExclusive(flag)) {
-		throw ErrnoError.With('EEXIST', fullPath, '_open');
-	}
+	if (flag & constants.O_EXCL) throw ErrnoError.With('EEXIST', fullPath, '_open');
 
-	const handle = new FileHandle($, file.toFD(new file.SyncHandle($, path, fs, resolved, flag, stats)));
+	const handle = new FileHandle($, toFD(new SyncHandle($, path, fs, resolved, flag, stats)));
 
 	/*
 		In a previous implementation, we deleted the file and
@@ -671,17 +677,15 @@ async function _open($: V_Context, path: fs.PathLike, opt: OpenOptions): Promise
 		asynchronous request was trying to read the file, as the file
 		would not exist for a small period of time.
 	*/
-	if (file.isTruncating(flag)) {
-		await handle.truncate(0);
-	}
+	if (flag & constants.O_TRUNC) await handle.truncate(0);
 
 	return handle;
 }
 
 /**
  * Asynchronous file open.
- * @see http://www.manpagez.com/man/2/open/
- * @param flag Handles the complexity of the various file modes. See its API for more details.
+ * @see https://nodejs.org/api/fs.html#fspromisesopenpath-flags-mode
+ * @param flag {@link https://nodejs.org/api/fs.html#file-system-flags}
  * @param mode Mode to use to open the file. Can be ignored if the filesystem doesn't support permissions.
  */
 export async function open(this: V_Context, path: fs.PathLike, flag: fs.OpenMode = 'r', mode: fs.Mode = 0o644): Promise<FileHandle> {
@@ -765,8 +769,8 @@ export async function appendFile(
 	_options?: BufferEncoding | (fs.EncodingOption & { mode?: fs.Mode; flag?: fs.OpenMode }) | null
 ): Promise<void> {
 	const options = normalizeOptions(_options, 'utf8', 'a', 0o644);
-	const flag = file.parseFlag(options.flag);
-	if (!file.isAppendable(flag)) {
+	const flag = flags.parse(options.flag);
+	if (!(flag & constants.O_APPEND)) {
 		throw new ErrnoError(Errno.EINVAL, 'Flag passed to appendFile must allow for appending');
 	}
 	if (typeof data != 'string' && !options.encoding) {
@@ -781,22 +785,18 @@ export async function appendFile(
 }
 appendFile satisfies typeof promises.appendFile;
 
-// DIRECTORY-ONLY METHODS
-
 export async function rmdir(this: V_Context, path: fs.PathLike): Promise<void> {
 	path = await realpath.call(this, path);
 	const { fs, path: resolved } = resolveMount(path, this);
 	try {
-		const stats = new Stats(await fs.stat(resolved));
-		if (!stats) {
-			throw ErrnoError.With('ENOENT', path, 'rmdir');
-		}
-		if (!stats.isDirectory()) {
-			throw ErrnoError.With('ENOTDIR', resolved, 'rmdir');
-		}
-		if (config.checkAccess && !stats.hasAccess(constants.W_OK, this)) {
-			throw ErrnoError.With('EACCES', resolved, 'rmdir');
-		}
+		const stats = await fs.stat(resolved);
+
+		if (!stats) throw ErrnoError.With('ENOENT', path, 'rmdir');
+
+		if (!isDirectory(stats)) throw ErrnoError.With('ENOTDIR', resolved, 'rmdir');
+
+		if (checkAccess && !hasAccess(this, stats, constants.W_OK)) throw ErrnoError.With('EACCES', resolved, 'rmdir');
+
 		await fs.rmdir(resolved);
 		emitChange(this, 'rename', path.toString());
 	} catch (e) {
@@ -823,7 +823,7 @@ export async function mkdir(
 	path: fs.PathLike,
 	options?: fs.Mode | fs.MakeDirectoryOptions | null
 ): Promise<string | undefined | void> {
-	const { euid: uid, egid: gid } = this?.credentials ?? credentials;
+	const { euid: uid, egid: gid } = this?.credentials ?? defaultContext.credentials;
 	options = typeof options === 'object' ? options : { mode: options };
 	const mode = normalizeMode(options?.mode, 0o777);
 
@@ -831,23 +831,21 @@ export async function mkdir(
 	const { fs, path: resolved, root } = resolveMount(path, this);
 	const errorPaths: Record<string, string> = { [resolved]: path };
 
-	const __create = async (path: string, parentStats: Stats) => {
-		if (config.checkAccess && !parentStats.hasAccess(constants.W_OK, this)) {
-			throw ErrnoError.With('EACCES', dirname(path), 'mkdir');
-		}
+	const __create = async (path: string, parent: InodeLike) => {
+		if (checkAccess && !hasAccess(this, parent, constants.W_OK)) throw ErrnoError.With('EACCES', dirname(path), 'mkdir');
 
 		const inode = await fs.mkdir(path, {
 			mode,
-			uid: parentStats.mode & constants.S_ISUID ? parentStats.uid : uid,
-			gid: parentStats.mode & constants.S_ISGID ? parentStats.gid : gid,
+			uid: parent.mode & constants.S_ISUID ? parent.uid : uid,
+			gid: parent.mode & constants.S_ISGID ? parent.gid : gid,
 		});
 		emitChange(this, 'rename', path);
-		return new Stats(inode);
+		return inode;
 	};
 
 	try {
 		if (!options?.recursive) {
-			await __create(resolved, new Stats(await fs.stat(dirname(resolved))));
+			await __create(resolved, await fs.stat(dirname(resolved)));
 			return;
 		}
 
@@ -859,7 +857,7 @@ export async function mkdir(
 
 		if (!dirs.length) return;
 
-		const stats: Stats[] = [new Stats(await fs.stat(dirname(dirs[0])))];
+		const stats: InodeLike[] = [await fs.stat(dirname(dirs[0]))];
 
 		for (const [i, dir] of dirs.entries()) {
 			stats.push(await __create(dir, stats[i]));
@@ -905,38 +903,29 @@ export async function readdir(
 
 	const { fs, path: resolved } = resolveMount(path, this);
 
-	const stats = await fs
-		.stat(resolved)
-		.then(i => new Stats(i))
-		.catch((e: ErrnoError) => _throw(fixError(e, { [resolved]: path })));
+	const stats = await fs.stat(resolved).catch((e: ErrnoError) => _throw(fixError(e, { [resolved]: path })));
 
 	if (!stats) {
 		throw ErrnoError.With('ENOENT', path, 'readdir');
 	}
 
-	if (config.checkAccess && !stats.hasAccess(constants.R_OK, this)) {
-		throw ErrnoError.With('EACCES', path, 'readdir');
-	}
+	if (checkAccess && !hasAccess(this, stats, constants.R_OK)) throw ErrnoError.With('EACCES', path, 'readdir');
 
-	if (!stats.isDirectory()) {
-		throw ErrnoError.With('ENOTDIR', path, 'readdir');
-	}
+	if (!isDirectory(stats)) throw ErrnoError.With('ENOTDIR', path, 'readdir');
 
 	const entries = await fs.readdir(resolved).catch((e: ErrnoError) => _throw(fixError(e, { [resolved]: path })));
 
 	const values: (string | Dirent | Buffer)[] = [];
 	const addEntry = async (entry: string) => {
-		let entryStats: Stats | undefined;
+		let entryStats: InodeLike | undefined;
 		if (options?.recursive || options?.withFileTypes) {
-			entryStats = await fs
-				.stat(join(resolved, entry))
-				.then(i => new Stats(i))
-				.catch((e: ErrnoError): undefined => {
-					if (e.code == 'ENOENT') return;
-					throw fixError(e, { [resolved]: path });
-				});
+			entryStats = await fs.stat(join(resolved, entry)).catch((e: ErrnoError): undefined => {
+				if (e.code == 'ENOENT') return;
+				throw fixError(e, { [resolved]: path });
+			});
 			if (!entryStats) return;
 		}
+
 		if (options?.withFileTypes) {
 			values.push(new Dirent(entry, entryStats!));
 		} else if (options?.encoding == 'buffer') {
@@ -945,7 +934,7 @@ export async function readdir(
 			values.push(entry);
 		}
 
-		if (!options?.recursive || !entryStats?.isDirectory()) return;
+		if (!options?.recursive || !isDirectory(entryStats!)) return;
 
 		for (const subEntry of await readdir.call(this, join(path, entry), options)) {
 			if (subEntry instanceof Dirent) {
@@ -977,17 +966,19 @@ export async function link(this: V_Context, targetPath: fs.PathLike, linkPath: f
 	}
 
 	try {
-		if (config.checkAccess && !new Stats(await fs.stat(dirname(targetPath))).hasAccess(constants.R_OK, this)) {
+		if (checkAccess && !hasAccess(this, await fs.stat(dirname(path)), constants.R_OK)) {
 			throw ErrnoError.With('EACCES', dirname(path), 'link');
 		}
 
-		if (config.checkAccess && !(await stat.call(this, dirname(linkPath))).hasAccess(constants.W_OK, this)) {
+		// We need to use the VFS here since the link path may be a mount point
+		if (checkAccess && !(await stat.call(this, dirname(linkPath))).hasAccess(constants.W_OK, this)) {
 			throw ErrnoError.With('EACCES', dirname(linkPath), 'link');
 		}
 
-		if (config.checkAccess && !new Stats(await fs.stat(path)).hasAccess(constants.R_OK, this)) {
+		if (checkAccess && !hasAccess(this, await fs.stat(path), constants.R_OK)) {
 			throw ErrnoError.With('EACCES', path, 'link');
 		}
+
 		return await fs.link(path, link.path);
 	} catch (e) {
 		throw fixError(e as ErrnoError, { [link.path]: linkPath, [path]: targetPath });
@@ -1106,10 +1097,7 @@ lutimes satisfies typeof promises.lutimes;
 async function _resolve($: V_Context, path: string, preserveSymlinks?: boolean): Promise<ResolvedPath> {
 	if (preserveSymlinks) {
 		const resolved = resolveMount(path, $);
-		const stats = await resolved.fs
-			.stat(resolved.path)
-			.then(i => new Stats(i))
-			.catch(() => undefined);
+		const stats = await resolved.fs.stat(resolved.path).catch(() => undefined);
 		return { ...resolved, fullPath: path, stats };
 	}
 
@@ -1119,9 +1107,9 @@ async function _resolve($: V_Context, path: string, preserveSymlinks?: boolean):
 		const resolved = resolveMount(path, $);
 
 		// Stat it to make sure it exists
-		const stats = new Stats(await resolved.fs.stat(resolved.path));
+		const stats = await resolved.fs.stat(resolved.path);
 
-		if (!stats.isSymbolicLink()) {
+		if (!isSymbolicLink(stats)) {
 			return { ...resolved, fullPath: path, stats };
 		}
 
@@ -1137,8 +1125,8 @@ async function _resolve($: V_Context, path: string, preserveSymlinks?: boolean):
 	const resolved = resolveMount(maybePath, $);
 
 	try {
-		const stats = new Stats(await resolved.fs.stat(resolved.path));
-		if (!stats.isSymbolicLink()) {
+		const stats = await resolved.fs.stat(resolved.path);
+		if (!isSymbolicLink(stats)) {
 			return { ...resolved, fullPath: maybePath, stats };
 		}
 
@@ -1241,7 +1229,7 @@ export function watch<T extends string | Buffer>(
 watch satisfies typeof promises.watch;
 
 export async function access(this: V_Context, path: fs.PathLike, mode: number = constants.F_OK): Promise<void> {
-	if (!config.checkAccess) return;
+	if (!checkAccess) return;
 	const stats = await stat.call(this, path);
 	if (!stats.hasAccess(mode, this)) {
 		throw new ErrnoError(Errno.EACCES);

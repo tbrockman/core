@@ -2,15 +2,16 @@
 
 import type * as fs from 'node:fs';
 import type { FileSystem } from '../internal/filesystem.js';
-import type { Stats } from './stats.js';
 
 import { InMemory } from '../backends/memory.js';
-import { bindContext, type BoundContext, type V_Context } from '../context.js';
+import type { V_Context } from '../context.js';
+import { defaultContext } from '../internal/contexts.js';
 import { Errno, ErrnoError } from '../internal/error.js';
+import type { InodeLike } from '../internal/inode.js';
 import { alert, debug, err, info, notice, warn } from '../internal/log.js';
+import { join, resolve, type AbsolutePath } from '../path.js';
 import { normalizePath } from '../utils.js';
 import { size_max } from './constants.js';
-import { join, resolve, type AbsolutePath } from '../path.js';
 
 /**
  * @internal @hidden
@@ -78,7 +79,7 @@ export interface ResolvedPath extends ResolvedMount {
 	/** The real, absolute path */
 	fullPath: string;
 	/** Stats */
-	stats?: Stats;
+	stats?: InodeLike;
 }
 
 /**
@@ -86,7 +87,7 @@ export interface ResolvedPath extends ResolvedMount {
  * @internal @hidden
  */
 export function resolveMount(path: string, ctx: V_Context): ResolvedMount {
-	const root = ctx?.root || '/';
+	const root = ctx?.root || defaultContext.root;
 	path = normalizePath(join(root, path));
 	const sortedMounts = [...mounts].sort((a, b) => (a[0].length > b[0].length ? -1 : 1)); // descending order of the string length
 	for (const [mountPoint, fs] of sortedMounts) {
@@ -149,21 +150,25 @@ export function _statfs<const T extends boolean>(fs: FileSystem, bigint?: T): T 
 
 /**
  * Change the root path
- * @param inPlace if true, this changes the root for the current context instead of creating a new one (if associated with a context).
  * @category Backends and Configuration
  */
-export function chroot(this: V_Context, path: string, inPlace?: false): BoundContext;
-export function chroot<T extends V_Context>(this: T, path: string, inPlace: true): T;
-export function chroot<T extends V_Context>(this: T & V_Context, path: string, inPlace?: boolean): T | BoundContext {
-	const creds = this?.credentials;
-	if (creds?.uid && creds?.gid && creds?.euid && creds?.egid) {
+export function chroot(this: V_Context, path: string) {
+	const $ = this ?? defaultContext;
+	if ($.credentials?.uid !== 0 && $.credentials?.gid !== 0 && $.credentials?.euid !== 0 && $.credentials?.egid !== 0)
 		throw new ErrnoError(Errno.EPERM, 'Can not chroot() as non-root user');
+
+	$.root ??= '/';
+
+	const newRoot = join($.root, path);
+
+	for (const handle of $.descriptors?.values() ?? []) {
+		if (!handle.path.startsWith($.root)) throw ErrnoError.With('EBUSY', handle.path, 'chroot');
+		(handle as any).path = handle.path.slice($.root.length);
 	}
-	if (inPlace && this) {
-		this.root += path;
-		return this;
-	}
-	return bindContext(join(this?.root || '/', path), creds);
+
+	if (newRoot.length > $.root.length) throw new ErrnoError(Errno.EPERM, 'Can not chroot() outside of current root');
+
+	$.root = newRoot;
 }
 
 /**

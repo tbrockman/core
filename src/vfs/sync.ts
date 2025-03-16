@@ -6,14 +6,16 @@ import { Stats } from './stats.js';
 import type { FileContents, GlobOptionsU, NullEnc, OpenOptions, ReaddirOptions, ReaddirOptsI, ReaddirOptsU } from './types.js';
 
 import { Buffer } from 'buffer';
-import { credentials } from '../internal/credentials.js';
+import { decodeUTF8, encodeUTF8 } from 'utilium';
+import { defaultContext } from '../internal/contexts.js';
 import { Errno, ErrnoError } from '../internal/error.js';
-import { decodeUTF8, normalizeMode, normalizeOptions, normalizePath, normalizeTime } from '../utils.js';
-import { config } from './config.js';
+import { hasAccess, isDirectory, isSymbolicLink, type InodeLike } from '../internal/inode.js';
+import { dirname, join, parse, resolve } from '../path.js';
+import { normalizeMode, normalizeOptions, normalizePath, normalizeTime } from '../utils.js';
+import { checkAccess } from './config.js';
 import * as constants from './constants.js';
 import { Dir, Dirent } from './dir.js';
-import { flagToMode, isAppendable, isExclusive, isReadable, isTruncating, isWriteable, parseFlag } from './file.js';
-import { dirname, join, parse, resolve } from '../path.js';
+import * as flags from './flags.js';
 import { _statfs, fixError, resolveMount } from './shared.js';
 import { BigIntStats } from './stats.js';
 import { emitChange } from './watchers.js';
@@ -23,7 +25,7 @@ export function renameSync(this: V_Context, oldPath: fs.PathLike, newPath: fs.Pa
 	newPath = normalizePath(newPath);
 	const oldMount = resolveMount(oldPath, this);
 	const newMount = resolveMount(newPath, this);
-	if (config.checkAccess && !statSync.call<V_Context, Parameters<fs.StatSyncFn>, Stats>(this, dirname(oldPath)).hasAccess(constants.W_OK, this)) {
+	if (checkAccess && !statSync.call<V_Context, Parameters<fs.StatSyncFn>, Stats>(this, dirname(oldPath)).hasAccess(constants.W_OK, this)) {
 		throw ErrnoError.With('EACCES', oldPath, 'rename');
 	}
 	try {
@@ -67,11 +69,11 @@ export function statSync(this: V_Context, path: fs.PathLike, options?: fs.StatOp
 	path = normalizePath(path);
 	const { fs, path: resolved } = resolveMount(realpathSync.call(this, path), this);
 	try {
-		const stats = new Stats(fs.statSync(resolved));
-		if (config.checkAccess && !stats.hasAccess(constants.R_OK, this)) {
+		const stats = fs.statSync(resolved);
+		if (checkAccess && !hasAccess(this, stats, constants.R_OK)) {
 			throw ErrnoError.With('EACCES', resolved, 'stat');
 		}
-		return options?.bigint ? new BigIntStats(stats) : stats;
+		return options?.bigint ? new BigIntStats(stats) : new Stats(stats);
 	} catch (e) {
 		throw fixError(e as ErrnoError, { [resolved]: path });
 	}
@@ -89,8 +91,11 @@ export function lstatSync(this: V_Context, path: fs.PathLike, options?: fs.StatO
 	path = normalizePath(path);
 	const { fs, path: resolved } = resolveMount(path, this);
 	try {
-		const stats = new Stats(fs.statSync(resolved));
-		return options?.bigint ? new BigIntStats(stats) : stats;
+		const stats = fs.statSync(resolved);
+		if (checkAccess && !hasAccess(this, stats, constants.R_OK)) {
+			throw ErrnoError.With('EACCES', resolved, 'lstat');
+		}
+		return options?.bigint ? new BigIntStats(stats) : new Stats(stats);
 	} catch (e) {
 		throw fixError(e as ErrnoError, { [resolved]: path });
 	}
@@ -111,7 +116,7 @@ export function unlinkSync(this: V_Context, path: fs.PathLike): void {
 	path = normalizePath(path);
 	const { fs, path: resolved } = resolveMount(path, this);
 	try {
-		if (config.checkAccess && !new Stats(fs.statSync(resolved)).hasAccess(constants.W_OK, this)) {
+		if (checkAccess && !hasAccess(this, fs.statSync(resolved), constants.W_OK)) {
 			throw ErrnoError.With('EACCES', resolved, 'unlink');
 		}
 		fs.unlinkSync(resolved);
@@ -125,39 +130,39 @@ unlinkSync satisfies typeof fs.unlinkSync;
 function _openSync(this: V_Context, path: fs.PathLike, opt: OpenOptions): SyncHandle {
 	path = normalizePath(path);
 	const mode = normalizeMode(opt.mode, 0o644),
-		flag = parseFlag(opt.flag);
+		flag = flags.parse(opt.flag);
 
 	path = opt.preserveSymlinks ? path : realpathSync.call(this, path);
 	const { fs, path: resolved } = resolveMount(path, this);
 
-	let stats: Stats | undefined;
+	let stats: InodeLike | undefined;
 	try {
-		stats = new Stats(fs.statSync(resolved));
+		stats = fs.statSync(resolved);
 	} catch {
 		// nothing
 	}
 
 	if (!stats) {
-		if ((!isWriteable(flag) && !isAppendable(flag)) || flag == 'r+') {
+		if (!(flag & constants.O_CREAT)) {
 			throw ErrnoError.With('ENOENT', path, '_open');
 		}
 		// Create the file
-		const parentStats: Stats = new Stats(fs.statSync(dirname(resolved)));
-		if (config.checkAccess && !parentStats.hasAccess(constants.W_OK, this)) {
+		const parentStats = fs.statSync(dirname(resolved));
+		if (checkAccess && !hasAccess(this, parentStats, constants.W_OK)) {
 			throw ErrnoError.With('EACCES', dirname(path), '_open');
 		}
 
-		if (!parentStats.isDirectory()) {
+		if (!isDirectory(parentStats)) {
 			throw ErrnoError.With('ENOTDIR', dirname(path), '_open');
 		}
 
 		if (!opt.allowDirectory && mode & constants.S_IFDIR) throw ErrnoError.With('EISDIR', path, '_open');
 
-		if (config.checkAccess && !parentStats.hasAccess(constants.W_OK, this)) {
+		if (checkAccess && !hasAccess(this, parentStats, constants.W_OK)) {
 			throw ErrnoError.With('EACCES', dirname(resolved), '_open');
 		}
 
-		const { euid: uid, egid: gid } = this?.credentials ?? credentials;
+		const { euid: uid, egid: gid } = this?.credentials ?? defaultContext.credentials;
 		const inode = fs.createFileSync(resolved, {
 			mode,
 			uid: parentStats.mode & constants.S_ISUID ? parentStats.uid : uid,
@@ -166,17 +171,15 @@ function _openSync(this: V_Context, path: fs.PathLike, opt: OpenOptions): SyncHa
 		return new SyncHandle(this, path, fs, resolved, flag, inode);
 	}
 
-	if (config.checkAccess && (!stats.hasAccess(mode, this) || !stats.hasAccess(flagToMode(flag), this))) {
+	if (checkAccess && (!hasAccess(this, stats, mode) || !hasAccess(this, stats, flags.toMode(flag)))) {
 		throw ErrnoError.With('EACCES', path, '_open');
 	}
 
-	if (isExclusive(flag)) throw ErrnoError.With('EEXIST', path, '_open');
+	if (flag & constants.O_EXCL) throw ErrnoError.With('EEXIST', path, '_open');
 
 	const file = new SyncHandle(this, path, fs, resolved, flag, stats);
 
-	if (isTruncating(flag)) {
-		file.truncate(0);
-	}
+	if (flag & constants.O_TRUNC) file.truncate(0);
 
 	if (!opt.allowDirectory && stats.mode & constants.S_IFDIR) throw ErrnoError.With('EISDIR', path, '_open');
 
@@ -185,7 +188,8 @@ function _openSync(this: V_Context, path: fs.PathLike, opt: OpenOptions): SyncHa
 
 /**
  * Synchronous file open.
- * @see http://www.manpagez.com/man/2/open/
+ * @see https://nodejs.org/api/fs.html#fsopensyncpath-flags-mode
+ * @param flag {@link https://nodejs.org/api/fs.html#file-system-flags}
  */
 export function openSync(this: V_Context, path: fs.PathLike, flag: fs.OpenMode, mode: fs.Mode | null = constants.F_OK): number {
 	return toFD(_openSync.call(this, path, { flag, mode }));
@@ -222,8 +226,8 @@ export function readFileSync(
 ): string;
 export function readFileSync(this: V_Context, path: fs.PathOrFileDescriptor, _options: fs.WriteFileOptions | null = {}): FileContents {
 	const options = normalizeOptions(_options, null, 'r', 0o644);
-	const flag = parseFlag(options.flag);
-	if (!isReadable(flag)) {
+	const flag = flags.parse(options.flag);
+	if (flag & constants.O_WRONLY) {
 		throw new ErrnoError(Errno.EINVAL, 'Flag passed to readFile must allow for reading');
 	}
 	const data: Buffer = Buffer.from(_readFileSync.call(this, path, options.flag, false));
@@ -248,8 +252,8 @@ export function writeFileSync(
 	_options: fs.WriteFileOptions | BufferEncoding = {}
 ): void {
 	const options = normalizeOptions(_options, 'utf8', 'w+', 0o644);
-	const flag = parseFlag(options.flag);
-	if (!isWriteable(flag)) {
+	const flag = flags.parse(options.flag);
+	if (!(flag & constants.O_WRONLY || flag & constants.O_RDWR)) {
 		throw new ErrnoError(Errno.EINVAL, 'Flag passed to writeFile must allow for writing');
 	}
 	if (typeof data != 'string' && !options.encoding) {
@@ -281,8 +285,8 @@ writeFileSync satisfies typeof fs.writeFileSync;
  */
 export function appendFileSync(this: V_Context, filename: fs.PathOrFileDescriptor, data: FileContents, _options: fs.WriteFileOptions = {}): void {
 	const options = normalizeOptions(_options, 'utf8', 'a+', 0o644);
-	const flag = parseFlag(options.flag);
-	if (!isAppendable(flag)) {
+	const flag = flags.parse(options.flag);
+	if (!(flag & constants.O_APPEND)) {
 		throw new ErrnoError(Errno.EINVAL, 'Flag passed to appendFile must allow for appending');
 	}
 	if (typeof data != 'string' && !options.encoding) {
@@ -307,8 +311,8 @@ appendFileSync satisfies typeof fs.appendFileSync;
 export function fstatSync(this: V_Context, fd: number, options?: { bigint?: boolean }): Stats;
 export function fstatSync(this: V_Context, fd: number, options: { bigint: true }): BigIntStats;
 export function fstatSync(this: V_Context, fd: number, options?: fs.StatOptions): Stats | BigIntStats {
-	const stats: Stats = new Stats(fromFD(this, fd).stat());
-	return options?.bigint ? new BigIntStats(stats) : stats;
+	const stats = fromFD(this, fd).stat();
+	return options?.bigint ? new BigIntStats(stats) : new Stats(stats);
 }
 fstatSync satisfies typeof fs.fstatSync;
 
@@ -453,11 +457,11 @@ export function rmdirSync(this: V_Context, path: fs.PathLike): void {
 	path = normalizePath(path);
 	const { fs, path: resolved } = resolveMount(realpathSync.call(this, path), this);
 	try {
-		const stats = new Stats(fs.statSync(resolved));
-		if (!stats.isDirectory()) {
+		const stats = fs.statSync(resolved);
+		if (!isDirectory(stats)) {
 			throw ErrnoError.With('ENOTDIR', resolved, 'rmdir');
 		}
-		if (config.checkAccess && !stats.hasAccess(constants.W_OK, this)) {
+		if (checkAccess && !hasAccess(this, stats, constants.W_OK)) {
 			throw ErrnoError.With('EACCES', resolved, 'rmdir');
 		}
 
@@ -476,7 +480,7 @@ export function mkdirSync(this: V_Context, path: fs.PathLike, options: fs.MakeDi
 export function mkdirSync(this: V_Context, path: fs.PathLike, options?: fs.Mode | (fs.MakeDirectoryOptions & { recursive?: false }) | null): void;
 export function mkdirSync(this: V_Context, path: fs.PathLike, options?: fs.Mode | fs.MakeDirectoryOptions | null): string | undefined;
 export function mkdirSync(this: V_Context, path: fs.PathLike, options?: fs.Mode | fs.MakeDirectoryOptions | null): string | undefined | void {
-	const { euid: uid, egid: gid } = this?.credentials ?? credentials;
+	const { euid: uid, egid: gid } = this?.credentials ?? defaultContext.credentials;
 	options = typeof options === 'object' ? options : { mode: options };
 	const mode = normalizeMode(options?.mode, 0o777);
 
@@ -484,24 +488,24 @@ export function mkdirSync(this: V_Context, path: fs.PathLike, options?: fs.Mode 
 	const { fs, path: resolved, root } = resolveMount(path, this);
 	const errorPaths: Record<string, string> = { [resolved]: path };
 
-	const __create = (path: string, parentStats: Stats) => {
-		if (config.checkAccess && !parentStats.hasAccess(constants.W_OK, this)) {
+	const __create = (path: string, parent: InodeLike) => {
+		if (checkAccess && !hasAccess(this, parent, constants.W_OK)) {
 			throw ErrnoError.With('EACCES', dirname(path), 'mkdir');
 		}
 
 		const inode = fs.mkdirSync(path, {
 			mode,
-			uid: parentStats.mode & constants.S_ISUID ? parentStats.uid : uid,
-			gid: parentStats.mode & constants.S_ISGID ? parentStats.gid : gid,
+			uid: parent.mode & constants.S_ISUID ? parent.uid : uid,
+			gid: parent.mode & constants.S_ISGID ? parent.gid : gid,
 		});
 
 		emitChange(this, 'rename', path);
-		return new Stats(inode);
+		return inode;
 	};
 
 	try {
 		if (!options?.recursive) {
-			__create(resolved, new Stats(fs.statSync(dirname(resolved))));
+			__create(resolved, fs.statSync(dirname(resolved)));
 			return;
 		}
 
@@ -513,7 +517,7 @@ export function mkdirSync(this: V_Context, path: fs.PathLike, options?: fs.Mode 
 
 		if (!dirs.length) return;
 
-		const stats: Stats[] = [new Stats(fs.statSync(dirname(dirs[0])))];
+		const stats: InodeLike[] = [fs.statSync(dirname(dirs[0]))];
 
 		for (const [i, dir] of dirs.entries()) {
 			stats.push(__create(dir, stats[i]));
@@ -548,11 +552,11 @@ export function readdirSync(
 	const { fs, path: resolved } = resolveMount(realpathSync.call(this, path), this);
 	let entries: string[];
 	try {
-		const stats = new Stats(fs.statSync(resolved));
-		if (config.checkAccess && !stats.hasAccess(constants.R_OK, this)) {
+		const stats = fs.statSync(resolved);
+		if (checkAccess && !hasAccess(this, stats, constants.R_OK)) {
 			throw ErrnoError.With('EACCES', resolved, 'readdir');
 		}
-		if (!stats.isDirectory()) {
+		if (!isDirectory(stats)) {
 			throw ErrnoError.With('ENOTDIR', resolved, 'readdir');
 		}
 		entries = fs.readdirSync(resolved);
@@ -563,9 +567,9 @@ export function readdirSync(
 	// Iterate over entries and handle recursive case if needed
 	const values: (string | Dirent | Buffer)[] = [];
 	for (const entry of entries) {
-		let entryStat: Stats;
+		let entryStat: InodeLike;
 		try {
-			entryStat = new Stats(fs.statSync(join(resolved, entry)));
+			entryStat = fs.statSync(join(resolved, entry));
 		} catch {
 			continue;
 		}
@@ -576,7 +580,7 @@ export function readdirSync(
 		} else {
 			values.push(entry);
 		}
-		if (!entryStat.isDirectory() || !options?.recursive) continue;
+		if (!isDirectory(entryStat) || !options?.recursive) continue;
 
 		for (const subEntry of readdirSync.call(this, join(path, entry), options)) {
 			if (subEntry instanceof Dirent) {
@@ -596,11 +600,11 @@ readdirSync satisfies typeof fs.readdirSync;
 
 export function linkSync(this: V_Context, targetPath: fs.PathLike, linkPath: fs.PathLike): void {
 	targetPath = normalizePath(targetPath);
-	if (config.checkAccess && !statSync(dirname(targetPath)).hasAccess(constants.R_OK, this)) {
+	if (checkAccess && !statSync(dirname(targetPath)).hasAccess(constants.R_OK, this)) {
 		throw ErrnoError.With('EACCES', dirname(targetPath), 'link');
 	}
 	linkPath = normalizePath(linkPath);
-	if (config.checkAccess && !statSync(dirname(linkPath)).hasAccess(constants.W_OK, this)) {
+	if (checkAccess && !statSync(dirname(linkPath)).hasAccess(constants.W_OK, this)) {
 		throw ErrnoError.With('EACCES', dirname(linkPath), 'link');
 	}
 
@@ -610,7 +614,7 @@ export function linkSync(this: V_Context, targetPath: fs.PathLike, linkPath: fs.
 		throw ErrnoError.With('EXDEV', linkPath, 'link');
 	}
 	try {
-		if (config.checkAccess && !new Stats(fs.statSync(path)).hasAccess(constants.R_OK, this)) {
+		if (checkAccess && !hasAccess(this, fs.statSync(path), constants.R_OK)) {
 			throw ErrnoError.With('EACCES', path, 'link');
 		}
 		return fs.linkSync(path, link.path);
@@ -630,12 +634,11 @@ export function symlinkSync(this: V_Context, target: fs.PathLike, path: fs.PathL
 	if (!['file', 'dir', 'junction'].includes(type!)) {
 		throw new ErrnoError(Errno.EINVAL, 'Invalid type: ' + type);
 	}
-	if (existsSync.call(this, path)) {
-		throw ErrnoError.With('EEXIST', path.toString(), 'symlink');
-	}
 
-	writeFileSync.call(this, path, normalizePath(target, true));
-	const file = _openSync.call(this, path, { flag: 'r+', mode: 0o644, preserveSymlinks: true });
+	path = normalizePath(path);
+
+	using file = _openSync.call(this, path, { flag: 'wx', mode: 0o644 });
+	file.write(encodeUTF8(normalizePath(target, true)));
 	file.chmod(constants.S_IFLNK);
 }
 symlinkSync satisfies typeof fs.symlinkSync;
@@ -718,7 +721,7 @@ lutimesSync satisfies typeof fs.lutimesSync;
 function _resolveSync($: V_Context, path: string, preserveSymlinks?: boolean): ResolvedPath {
 	if (preserveSymlinks) {
 		const resolved = resolveMount(path, $);
-		const stats = new Stats(resolved.fs.statSync(resolved.path));
+		const stats = resolved.fs.statSync(resolved.path);
 		return { ...resolved, fullPath: path, stats };
 	}
 
@@ -728,9 +731,9 @@ function _resolveSync($: V_Context, path: string, preserveSymlinks?: boolean): R
 		const resolved = resolveMount(path, $);
 
 		// Stat it to make sure it exists
-		const stats = new Stats(resolved.fs.statSync(resolved.path));
+		const stats = resolved.fs.statSync(resolved.path);
 
-		if (!stats.isSymbolicLink()) {
+		if (!isSymbolicLink(stats)) {
 			return { ...resolved, fullPath: path, stats };
 		}
 
@@ -746,8 +749,8 @@ function _resolveSync($: V_Context, path: string, preserveSymlinks?: boolean): R
 	const resolved = resolveMount(maybePath, $);
 
 	try {
-		const stats = new Stats(resolved.fs.statSync(resolved.path));
-		if (!stats.isSymbolicLink()) {
+		const stats = resolved.fs.statSync(resolved.path);
+		if (!isSymbolicLink(stats)) {
 			return { ...resolved, fullPath: maybePath, stats };
 		}
 
@@ -776,8 +779,8 @@ export function realpathSync(this: V_Context, path: fs.PathLike, options?: fs.En
 realpathSync satisfies Omit<typeof fs.realpathSync, 'native'>;
 
 export function accessSync(this: V_Context, path: fs.PathLike, mode: number = 0o600): void {
-	if (!config.checkAccess) return;
-	if (!statSync.call<V_Context, Parameters<fs.StatSyncFn>, Stats>(this, path).hasAccess(mode, this)) {
+	if (!checkAccess) return;
+	if (!hasAccess(this, statSync.call<V_Context, Parameters<fs.StatSyncFn>, InodeLike>(this, path), mode)) {
 		throw new ErrnoError(Errno.EACCES);
 	}
 }
@@ -790,7 +793,7 @@ accessSync satisfies typeof fs.accessSync;
 export function rmSync(this: V_Context, path: fs.PathLike, options?: fs.RmOptions): void {
 	path = normalizePath(path);
 
-	let stats: Stats | undefined;
+	let stats: InodeLike | undefined;
 	try {
 		stats = (lstatSync.bind(this) as typeof statSync)(path);
 	} catch (error) {

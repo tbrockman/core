@@ -1,14 +1,14 @@
-import { _throw, canary, sizeof } from 'utilium';
+import { _throw, canary, encodeUTF8, serialize, sizeof } from 'utilium';
 import { extendBuffer } from 'utilium/buffer.js';
 import { Errno, ErrnoError } from '../../internal/error.js';
 import { Index } from '../../internal/file_index.js';
-import type { CreationOptions, PureCreationOptions, UsageInfo } from '../../internal/filesystem.js';
+import type { CreationOptions, UsageInfo } from '../../internal/filesystem.js';
 import { FileSystem } from '../../internal/filesystem.js';
 import { Inode, isDirectory, rootIno, type InodeLike } from '../../internal/inode.js';
 import { crit, debug, err, notice, warn } from '../../internal/log.js';
-import { decodeDirListing, encodeDirListing, encodeUTF8 } from '../../utils.js';
-import { S_IFDIR, S_IFREG, size_max } from '../../vfs/constants.js';
 import { basename, dirname, join, parse, relative } from '../../path.js';
+import { decodeDirListing, encodeDirListing } from '../../utils.js';
+import { S_IFDIR, S_IFREG, size_max } from '../../vfs/constants.js';
 import { WrappedTransaction, type Store } from './store.js';
 
 /**
@@ -125,7 +125,7 @@ export class StoreFS<T extends Store = Store> extends FileSystem {
 
 		for (const [path, inode] of index) {
 			this._add(inode.ino, path);
-			await tx.set(inode.ino, inode.serialize());
+			await tx.set(inode.ino, serialize(inode));
 			if (dirs.has(path)) await tx.set(inode.data, encodeDirListing(dirs.get(path)!));
 		}
 
@@ -143,7 +143,7 @@ export class StoreFS<T extends Store = Store> extends FileSystem {
 
 		for (const [path, inode] of index) {
 			this._add(inode.ino, path);
-			tx.setSync(inode.ino, inode.serialize());
+			tx.setSync(inode.ino, serialize(inode));
 			if (dirs.has(path)) tx.setSync(inode.data, encodeDirListing(dirs.get(path)!));
 		}
 
@@ -323,7 +323,7 @@ export class StoreFS<T extends Store = Store> extends FileSystem {
 
 		if (inode.update(metadata)) {
 			this._add(inode.ino, path);
-			tx.setSync(inode.ino, inode.serialize());
+			tx.setSync(inode.ino, serialize(inode));
 		}
 
 		await tx.commit();
@@ -336,7 +336,7 @@ export class StoreFS<T extends Store = Store> extends FileSystem {
 
 		if (inode.update(metadata)) {
 			this._add(inode.ino, path);
-			tx.setSync(inode.ino, inode.serialize());
+			tx.setSync(inode.ino, serialize(inode));
 		}
 
 		tx.commitSync();
@@ -408,7 +408,7 @@ export class StoreFS<T extends Store = Store> extends FileSystem {
 
 		if (inode.update(metadata)) {
 			this._add(inode.ino, path);
-			await tx.set(inode.ino, inode.serialize());
+			await tx.set(inode.ino, serialize(inode));
 		}
 
 		await tx.commit();
@@ -426,7 +426,7 @@ export class StoreFS<T extends Store = Store> extends FileSystem {
 
 		if (inode.update(metadata)) {
 			this._add(inode.ino, path);
-			tx.setSync(inode.ino, inode.serialize());
+			tx.setSync(inode.ino, serialize(inode));
 		}
 
 		tx.commitSync();
@@ -445,7 +445,7 @@ export class StoreFS<T extends Store = Store> extends FileSystem {
 		listing[basename(link)] = inode.ino;
 
 		this._add(inode.ino, link);
-		await tx.set(inode.ino, inode.serialize());
+		await tx.set(inode.ino, serialize(inode));
 		await tx.set(newDirNode.data, encodeDirListing(listing));
 		await tx.commit();
 	}
@@ -463,7 +463,7 @@ export class StoreFS<T extends Store = Store> extends FileSystem {
 		listing[basename(link)] = inode.ino;
 
 		this._add(inode.ino, link);
-		tx.setSync(inode.ino, inode.serialize());
+		tx.setSync(inode.ino, serialize(inode));
 		tx.setSync(newDirNode.data, encodeDirListing(listing));
 		tx.commitSync();
 	}
@@ -549,7 +549,7 @@ export class StoreFS<T extends Store = Store> extends FileSystem {
 		await tx.set(inode.data, encodeUTF8('{}'));
 
 		this._add(rootIno, '/');
-		await tx.set(rootIno, inode.serialize());
+		await tx.set(rootIno, serialize(inode));
 		await tx.commit();
 	}
 
@@ -564,7 +564,7 @@ export class StoreFS<T extends Store = Store> extends FileSystem {
 		tx.setSync(inode.data, encodeUTF8('{}'));
 
 		this._add(rootIno, '/');
-		tx.setSync(rootIno, inode.serialize());
+		tx.setSync(rootIno, serialize(inode));
 		tx.commitSync();
 	}
 
@@ -585,7 +585,7 @@ export class StoreFS<T extends Store = Store> extends FileSystem {
 			const inode = new Inode({ ino: rootIno, data: 1, mode: 0o777 | S_IFDIR });
 			await tx.set(inode.data, encodeUTF8('{}'));
 			this._add(rootIno, '/');
-			await tx.set(rootIno, inode.serialize());
+			await tx.set(rootIno, serialize(inode));
 			await tx.commit();
 			return;
 		}
@@ -694,7 +694,7 @@ export class StoreFS<T extends Store = Store> extends FileSystem {
 	 * @param options The options to create the new file with.
 	 * @param data The data to store at the file's data node.
 	 */
-	protected async commitNew(path: string, options: PureCreationOptions, data: Uint8Array, syscall: string): Promise<Inode> {
+	protected async commitNew(path: string, options: CreationOptions, data: Uint8Array, syscall: string): Promise<Inode> {
 		/*
 			The root always exists.
 			If we don't check this prior to taking steps below,
@@ -721,7 +721,7 @@ export class StoreFS<T extends Store = Store> extends FileSystem {
 			size: data.byteLength,
 		});
 
-		await tx.set(inode.ino, inode.serialize());
+		await tx.set(inode.ino, serialize(inode));
 		await tx.set(inode.data, data);
 
 		// Update and commit parent directory listing.
@@ -739,7 +739,7 @@ export class StoreFS<T extends Store = Store> extends FileSystem {
 	 * @param data The data to store at the file's data node.
 	 * @return The Inode for the new file.
 	 */
-	protected commitNewSync(path: string, options: PureCreationOptions, data: Uint8Array, syscall: string): Inode {
+	protected commitNewSync(path: string, options: CreationOptions, data: Uint8Array, syscall: string): Inode {
 		/*
 			The root always exists.
 			If we don't check this prior to taking steps below,
@@ -768,7 +768,7 @@ export class StoreFS<T extends Store = Store> extends FileSystem {
 		});
 
 		// Update and commit parent directory listing.
-		tx.setSync(inode.ino, inode.serialize());
+		tx.setSync(inode.ino, serialize(inode));
 		tx.setSync(inode.data, data);
 		listing[fname] = inode.ino;
 		tx.setSync(parent.data, encodeDirListing(listing));
@@ -805,7 +805,7 @@ export class StoreFS<T extends Store = Store> extends FileSystem {
 
 		if (inode.nlink > 1) {
 			inode.update({ nlink: inode.nlink - 1 });
-			await tx.set(inode.ino, inode.serialize());
+			await tx.set(inode.ino, serialize(inode));
 		} else {
 			await tx.remove(inode.data);
 			await tx.remove(ino);
@@ -842,7 +842,7 @@ export class StoreFS<T extends Store = Store> extends FileSystem {
 
 		if (inode.nlink > 1) {
 			inode.update({ nlink: inode.nlink - 1 });
-			tx.setSync(inode.ino, inode.serialize());
+			tx.setSync(inode.ino, serialize(inode));
 		} else {
 			tx.removeSync(inode.data);
 			tx.removeSync(ino);

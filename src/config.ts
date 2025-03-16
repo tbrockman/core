@@ -1,13 +1,14 @@
 import type { Backend, BackendConfiguration, FilesystemOf, SharedConfig } from './backends/backend.js';
 import { checkOptions, isBackend, isBackendConfig } from './backends/backend.js';
-import { useCredentials } from './internal/credentials.js';
+import { defaultContext } from './internal/contexts.js';
+import { createCredentials } from './internal/credentials.js';
 import type { Device, DeviceDriver } from './internal/devices.js';
 import { DeviceFS } from './internal/devices.js';
 import { Errno, ErrnoError } from './internal/error.js';
 import { FileSystem } from './internal/filesystem.js';
 import type { LogConfiguration } from './internal/log.js';
 import { configure as configureLog, crit, err, info } from './internal/log.js';
-import { config } from './vfs/config.js';
+import { _setAccessChecks } from './vfs/config.js';
 import * as fs from './vfs/index.js';
 import { mounts } from './vfs/shared.js';
 
@@ -115,27 +116,17 @@ export interface Configuration<T extends ConfigMounts> extends SharedConfig {
 	disableAccessChecks: boolean;
 
 	/**
-	 * If true, disables `read` and `readSync` from updating the atime.
-	 *
-	 * This can increase performance.
-	 * @experimental
-	 * @default false
-	 */
-	disableUpdateOnRead: boolean;
-
-	/**
 	 * If true, files will only sync to the file system when closed.
+	 * This overrides `disableUpdateOnRead`
 	 *
 	 * This can increase performance.
 	 * @experimental
-	 * @overrides `disableUpdateOnRead`
 	 * @default false
 	 */
 	onlySyncOnClose: boolean;
 
 	/**
 	 * Configurations options for the log.
-	 * @experimental
 	 */
 	log: LogConfiguration;
 }
@@ -193,11 +184,9 @@ export async function configure<T extends ConfigMounts>(configuration: Partial<C
 	const uid = 'uid' in configuration ? configuration.uid || 0 : 0;
 	const gid = 'gid' in configuration ? configuration.gid || 0 : 0;
 
-	useCredentials({ uid, gid });
+	Object.assign(defaultContext.credentials, createCredentials({ uid, gid }));
 
-	config.checkAccess = !configuration.disableAccessChecks;
-	config.updateOnRead = !configuration.disableUpdateOnRead;
-	config.syncImmediately = !configuration.onlySyncOnClose;
+	_setAccessChecks(!configuration.disableAccessChecks);
 
 	if (configuration.log) configureLog(configuration.log);
 
